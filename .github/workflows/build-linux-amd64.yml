@@ -1,0 +1,88 @@
+name: Build Linux amd64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build embedded frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build:embedded
+      - name: Build Linux binaries
+        working-directory: backend
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p ../build
+          go build -buildvcs=false -trimpath -tags 'embed_frontend nodynamic' -ldflags='-s -w' -o ../build/chatapi ./cmd/server
+          go build -buildvcs=false -trimpath -ldflags='-s -w' -o ../build/migrate-db ./cmd/migrate-db
+      - name: Smoke test
+        env:
+          CHATAPI_HOST: 127.0.0.1
+          CHATAPI_PORT: '18080'
+          CHATAPI_DB_DRIVER: sqlite
+          CHATAPI_ADMIN_USERNAME: smokeadmin
+        run: |
+          export CHATAPI_DATA_DIR="$(mktemp -d)"
+          export CHATAPI_DB_DSN="$CHATAPI_DATA_DIR/chatapi.sqlite3"
+          export CHATAPI_MASTER_KEY="$(openssl rand -base64 48)"
+          export CHATAPI_SESSION_SECRET="$(openssl rand -base64 48)"
+          export CHATAPI_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export CHATAPI_BASE_URL=http://127.0.0.1:18080
+          export CHATAPI_CORS_ORIGINS=http://127.0.0.1:18080
+          ./build/chatapi > "$RUNNER_TEMP/chatapi-smoke.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18080/api/ready; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            cat "$RUNNER_TEMP/chatapi-smoke.log"
+            exit 1
+          fi
+          curl --fail --silent http://127.0.0.1:18080/ -o "$RUNNER_TEMP/chatapi-index.html"
+          grep -qi '<html' "$RUNNER_TEMP/chatapi-index.html"
+      - name: Package
+        run: |
+          cp backend/.env.example build/chatapi.env.example
+          cp LICENSE build/LICENSE
+          printf 'source=%s\ncommit=%s\nbuilt_at=%s\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$(date -u +%FT%TZ)" > build/BUILD-INFO.txt
+          tar -czf chatapi-linux-amd64.tar.gz -C build chatapi migrate-db chatapi.env.example LICENSE BUILD-INFO.txt
+          sha256sum chatapi-linux-amd64.tar.gz > SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatapi-linux-amd64
+          path: |
+            chatapi-linux-amd64.tar.gz
+            SHA256SUMS
+          retention-days: 30
+          if-no-files-found: error
